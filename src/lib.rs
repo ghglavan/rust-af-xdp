@@ -354,6 +354,9 @@ mod tests {
     // idk why yet, but it seems like there should be some extra cleanup that we missed
     // for now, we leave the async one because it actually contains the sync part
 
+    // after testing with --test-threads=1 and merging the two threads it is obvious that
+    // this is a cleanup problem
+
     // #[test]
     // #[cfg(feature = "bypass_link_xdp_id")]
     // fn basic_build_and_drop_xsk_sync() {

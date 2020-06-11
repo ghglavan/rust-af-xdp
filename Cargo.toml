@@ -1,0 +1,23 @@
+[package]
+name = "rust-af-xdp"
+version = "0.1.0"
+authors = ["gglavan"]
+edition = "2018"
+
+[dependencies]
+libbpf-sys = "0.0.6-7"
+libc = "0.2.67"
+nix = "0.17.0"
+sysconf = "0.3.4"
+
+# using features = "full" is a big nono, but since we need it for the tokio runtime for tests,
+# we should find a way to use "full" only in tests or to only use runtime stuff
+
+tokio = {version = "0.2.21", features = ["full"]}
+
+
+mio = "0.6.20"
+futures = "0.3.0"
+
+[features]
+bypass_link_xdp_id = []

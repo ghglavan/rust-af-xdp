@@ -1,392 +1,462 @@
-pub(crate) use libbpf_sys::*;
-use libc::{free, if_nametoindex, posix_memalign};
-use nix::errno;
-use std::ffi::{CStr, CString};
-use sysconf::page::pagesize;
+pub(crate) mod defaults;
 
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use mio::{Poll, PollOpt, Ready, Token};
+pub mod umem;
+pub mod xsk_stream;
 
-use std::io;
-use std::os::unix::io::RawFd;
+// pub(crate) use libbpf_sys::*;
+// use libc::{free, if_nametoindex, posix_memalign};
+// use nix::errno;
+// use std::ffi::{CStr, CString};
+// use sysconf::page::pagesize;
 
-use tokio::io::PollEvented;
+// use mio::event::Evented;
+// use mio::unix::EventedFd;
+// use mio::{PollOpt, Ready, Token};
 
-use futures::ready;
+// use std::io;
+// use std::os::unix::io::RawFd;
 
-static DEFAULT_N_FRAMES: u64 = 4096u64;
-static DEFAULT_FRAME_SIZE: u64 = XSK_UMEM__DEFAULT_FRAME_SIZE as u64;
+// use tokio::io::PollEvented;
+// use tokio::sync::mpsc::error::TrySendError;
+// use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-static DEFAULT_CONS_NUM_DESCS: u32 = XSK_RING_CONS__DEFAULT_NUM_DESCS as u32;
-static DEFAULT_PROD_NUM_DESCS: u32 = XSK_RING_PROD__DEFAULT_NUM_DESCS as u32;
+// use futures::task::Context;
+// use std::sync::{Arc, Mutex};
 
-struct XskUmem {
-    umem_p: *mut xsk_umem,
-    inner_buf: *mut core::ffi::c_void,
-}
+// use futures::stream::Stream;
 
-struct XskUmemInfo {
-    prod: xsk_ring_prod,
-    cons: xsk_ring_cons,
+// use core::pin::Pin;
 
-    n_frames: u64,
-    frame_size: u64,
+// struct XskSocketInfo {
+//     cons_ring: xsk_ring_cons,
+//     prod_ring: xsk_ring_prod,
 
-    umem: XskUmem,
-}
+//     // TODO:
+//     // fow now we have a single socket for a
+//     // umem. in the future we can change that
+//     // but this means that we either do some
+//     // futures magic to synchronize the rings
+//     // or we just Arc<Mutex<UMEM>>
+//     umem_info: XskUmemInfo,
+//     free_frame_addrs: Vec<u64>,
 
-impl Drop for XskUmemInfo {
-    fn drop(&mut self) {
-        unsafe {
-            xsk_umem__delete(self.umem.umem_p);
-            free(self.umem.inner_buf);
-        }
-    }
-}
+//     rx_batch_size: u32,
 
-struct XskUmemInfoBuilder {
-    inner: Box<XskUmemInfo>,
-}
+//     ifname: String,
+//     if_queue_id: u32,
 
-impl XskUmemInfoBuilder {
-    fn new() -> Self {
-        let inner = Box::new(XskUmemInfo {
-            prod: Default::default(),
-            cons: Default::default(),
-            n_frames: DEFAULT_N_FRAMES,
-            frame_size: DEFAULT_FRAME_SIZE,
-            umem: XskUmem {
-                umem_p: std::ptr::null_mut(),
-                inner_buf: std::ptr::null_mut(),
-            },
-        });
+//     sock: *mut xsk_socket,
+// }
 
-        XskUmemInfoBuilder { inner }
-    }
+// impl XskSocketInfo {
+//     fn get_raw_fd(&self) -> RawFd {
+//         unsafe { xsk_socket__fd(self.sock) }
+//     }
+// }
 
-    fn with_n_frames(mut self, n_frames: u64) -> Self {
-        self.inner.n_frames = n_frames;
+// impl Drop for XskSocketInfo {
+//     fn drop(&mut self) {
+//         unsafe {
+//             xsk_socket__delete(self.sock);
+//         }
+//     }
+// }
 
-        self
-    }
+// struct XskSocketInfoBuilder {
+//     inner: Box<XskSocketInfo>,
+//     conf: Box<xsk_socket_config>,
+// }
 
-    fn with_frame_size(mut self, size: u64) -> Self {
-        self.inner.frame_size = size;
+// impl XskSocketInfoBuilder {
+//     fn new(umem_info: XskUmemInfo, ifname: String, if_queue_id: u32) -> Self {
+//         let inner = Box::new(XskSocketInfo {
+//             cons_ring: Default::default(),
+//             prod_ring: Default::default(),
+//             free_frame_addrs: Vec::new(),
+//             rx_batch_size: DEFAULT_BATCH_SIZE,
+//             umem_info,
+//             if_queue_id,
+//             ifname,
 
-        self
-    }
+//             sock: std::ptr::null_mut(),
+//         });
 
-    fn build(mut self) -> Result<XskUmemInfo, String> {
-        let buf: *mut core::ffi::c_void = std::ptr::null_mut();
-        let buf_size = (self.inner.n_frames * self.inner.frame_size) as usize;
+//         XskSocketInfoBuilder {
+//             inner,
+//             conf: Box::new(xsk_socket_config {
+//                 rx_size: DEFAULT_CONS_NUM_DESCS,
+//                 tx_size: DEFAULT_PROD_NUM_DESCS,
+//                 libbpf_flags: 0,
+//                 xdp_flags: 0,
+//                 bind_flags: 0,
+//             }),
+//         }
+//     }
 
-        // todo: we should probably provide more options here
-        let ret = unsafe {
-            libc::posix_memalign(
-                &buf as *const *mut std::ffi::c_void as *mut *mut std::ffi::c_void,
-                pagesize(),
-                buf_size,
-            )
-        };
+//     fn with_rx_size(mut self, size: u32) -> Self {
+//         self.conf.rx_size = size;
 
-        if ret != 0 {
-            return Err(format!("error posix memaligning: {}", ret));
-        }
+//         self
+//     }
 
-        let ret = unsafe {
-            xsk_umem__create(
-                &self.inner.umem.umem_p as *const *mut xsk_umem as *mut *mut xsk_umem,
-                buf,
-                buf_size as u64,
-                &self.inner.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
-                &self.inner.cons as *const xsk_ring_cons as *mut xsk_ring_cons,
-                // for now we dont provide a xsk_umem_config we should do this using the builder pattern in the future
-                // the same way we use xsk_socket_config for XskSocketInfo. But since there are less important options
-                // for umem, we can leave it null
-                std::ptr::null(),
-            )
-        };
+//     fn with_rx_batch_size(mut self, size: u32) -> Self {
+//         self.inner.rx_batch_size = size;
 
-        if ret != 0 {
-            unsafe {
-                free(buf);
-            }
-            return Err(format!("error xsk_umem_creating: {}", ret));
-        }
+//         self
+//     }
 
-        self.inner.umem.inner_buf = buf;
+//     fn with_tx_size(mut self, size: u32) -> Self {
+//         self.conf.tx_size = size;
 
-        Ok(*self.inner)
-    }
-}
+//         self
+//     }
 
-struct XskSocketInfo {
-    cons_ring: xsk_ring_cons,
-    prod_ring: xsk_ring_prod,
-    umem_info: XskUmemInfo,
-    free_frames_idxes: Vec<u64>,
-    ifname: String,
-    if_queue_id: u32,
+//     fn with_libbpf_flag(mut self, flag: u32) -> Self {
+//         self.conf.libbpf_flags |= flag;
 
-    sock: *mut xsk_socket,
-}
+//         self
+//     }
 
-impl XskSocketInfo {
-    fn get_raw_fd(&self) -> RawFd {
-        unsafe { xsk_socket__fd(self.sock) }
-    }
-}
+//     fn with_xdp_flag(mut self, flag: u32) -> Self {
+//         self.conf.xdp_flags |= flag;
 
-impl Drop for XskSocketInfo {
-    fn drop(&mut self) {
-        unsafe {
-            xsk_socket__delete(self.sock);
-        }
-    }
-}
+//         self
+//     }
 
-struct XskSocketAsync {
-    inner: XskSocketInfo,
-}
+//     fn with_bind_flag(mut self, flag: u16) -> Self {
+//         self.conf.bind_flags |= flag;
 
-impl Evented for XskSocketAsync {
-    fn register(
-        &self,
-        poll: &Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.inner.get_raw_fd()).register(poll, token, interest, opts)
-    }
+//         self
+//     }
 
-    fn reregister(
-        &self,
-        poll: &Poll,
-        token: Token,
-        interest: Ready,
-        opts: PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.inner.get_raw_fd()).reregister(poll, token, interest, opts)
-    }
+//     fn build(mut self) -> Result<XskSocketInfo, String> {
+//         let c_str = CString::new(self.inner.ifname.clone())
+//             .map_err(|e| format!("error creating a cstring: {}", e))?;
 
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        EventedFd(&self.inner.get_raw_fd()).deregister(poll)
-    }
-}
+//         let ifindex = unsafe { if_nametoindex(c_str.as_ptr() as *const i8) };
 
-struct XskStream {
-    inner: PollEvented<XskSocketAsync>,
-}
+//         if ifindex == 0 {
+//             return Err(format!(
+//                 "invalid interface {}: {}",
+//                 self.inner.ifname,
+//                 errno::errno()
+//             ));
+//         }
 
-struct XskSocketInfoBuilder {
-    inner: Box<XskSocketInfo>,
-    conf: Box<xsk_socket_config>,
-}
+//         let ret = unsafe {
+//             xsk_socket__create(
+//                 &self.inner.sock as *const *mut xsk_socket as *mut *mut xsk_socket,
+//                 c_str.into_raw() as *const ::std::os::raw::c_char,
+//                 self.inner.if_queue_id,
+//                 self.inner.umem_info.umem.umem_p,
+//                 &self.inner.cons_ring as *const xsk_ring_cons as *mut xsk_ring_cons,
+//                 &self.inner.prod_ring as *const xsk_ring_prod as *mut xsk_ring_prod,
+//                 Box::into_raw(self.conf.clone()),
+//             )
+//         };
 
-impl XskSocketInfoBuilder {
-    fn new(umem_info: XskUmemInfo, ifname: String, if_queue_id: u32) -> Self {
-        let inner = Box::new(XskSocketInfo {
-            cons_ring: Default::default(),
-            prod_ring: Default::default(),
-            free_frames_idxes: Vec::new(),
-            umem_info,
-            if_queue_id,
-            ifname,
+//         if ret != 0 {
+//             return Err(format!("error creating xsk_socket: {}", ret));
+//         }
 
-            sock: std::ptr::null_mut(),
-        });
+//         #[cfg(feature = "bypass_link_xdp_id")]
+//         {
+//             let prog_id = 0u32;
+//             let retw = unsafe {
+//                 bpf_get_link_xdp_id(
+//                     ifindex as i32,
+//                     &prog_id as *const u32 as *mut u32,
+//                     self.conf.xdp_flags,
+//                 )
+//             };
+//             if retw != 0 {
+//                 unsafe { xsk_socket__delete(self.inner.sock) };
+//                 return Err(format!("error getting link xdp_id: {}", retw));
+//             }
+//         }
 
-        XskSocketInfoBuilder {
-            inner,
-            conf: Box::new(xsk_socket_config {
-                rx_size: DEFAULT_CONS_NUM_DESCS,
-                tx_size: DEFAULT_PROD_NUM_DESCS,
-                libbpf_flags: 0,
-                xdp_flags: 0,
-                bind_flags: 0,
-            }),
-        }
-    }
+//         for i in 0..self.inner.umem_info.n_frames {
+//             self.inner
+//                 .free_frame_addrs
+//                 .push(i * self.inner.umem_info.frame_size);
+//         }
 
-    fn with_rx_size(mut self, size: u32) -> Self {
-        self.conf.rx_size = size;
+//         let mut idx = 0u32;
+//         let ret = unsafe {
+//             _xsk_ring_prod__reserve(
+//                 &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
+//                 self.conf.tx_size as u64,
+//                 &idx as *const u32 as *mut u32,
+//             )
+//         };
 
-        self
-    }
+//         if ret != self.conf.tx_size as u64 {
+//             return Err(format!(
+//                 "error reserving prod ring of size {}, got {}",
+//                 self.conf.tx_size, ret
+//             ));
+//         }
+//         if self.inner.free_frame_addrs.len() < self.conf.tx_size as usize {
+//             return Err(format!(
+//                 "error: not enough free frames: expected {} got {}",
+//                 self.conf.tx_size,
+//                 self.inner.free_frame_addrs.len()
+//             ));
+//         }
+//         for i in 0..self.conf.tx_size {
+//             unsafe {
+//                 *_xsk_ring_prod__fill_addr(
+//                     &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
+//                     idx,
+//                 ) = self.inner.free_frame_addrs.pop().ok_or(format!(
+//                     "not enoug frames to fill the producer. Expected {} got {}",
+//                     self.conf.tx_size, i
+//                 ))?
+//             };
+//             idx += 1;
+//         }
 
-    fn with_tx_size(mut self, size: u32) -> Self {
-        self.conf.tx_size = size;
+//         unsafe {
+//             _xsk_ring_prod__submit(
+//                 &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
+//                 self.conf.tx_size as u64,
+//             )
+//         };
 
-        self
-    }
+//         Ok(*self.inner)
+//     }
 
-    fn with_libbpf_flag(mut self, flag: u32) -> Self {
-        self.conf.libbpf_flags |= flag;
+//     async fn build_async(mut self) -> Result<XskStream, String> {
+//         let (addrs_tx, addrs_rx) = channel(self.inner.umem_info.n_frames as usize);
+//         let poll_evented = PollEvented::new(XskSocketAsync {
+//             inner: self.build()?,
+//         })
+//         .map_err(|e| format!("error creating poll evented: {}", e))?;
 
-        self
-    }
+//         Ok(XskStream {
+//             inner: poll_evented,
+//             addrs_rx,
+//             addrs_tx,
+//         })
+//     }
+// }
 
-    fn with_xdp_flag(mut self, flag: u32) -> Self {
-        self.conf.xdp_flags |= flag;
+// struct XskSocketAsync {
+//     inner: XskSocketInfo,
+// }
 
-        self
-    }
+// impl Evented for XskSocketAsync {
+//     fn register(
+//         &self,
+//         poll: &mio::Poll,
+//         token: Token,
+//         interest: Ready,
+//         opts: PollOpt,
+//     ) -> io::Result<()> {
+//         EventedFd(&self.inner.get_raw_fd()).register(poll, token, interest, opts)
+//     }
 
-    fn with_bind_flag(mut self, flag: u16) -> Self {
-        self.conf.bind_flags |= flag;
+//     fn reregister(
+//         &self,
+//         poll: &mio::Poll,
+//         token: Token,
+//         interest: Ready,
+//         opts: PollOpt,
+//     ) -> io::Result<()> {
+//         EventedFd(&self.inner.get_raw_fd()).reregister(poll, token, interest, opts)
+//     }
 
-        self
-    }
+//     fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
+//         EventedFd(&self.inner.get_raw_fd()).deregister(poll)
+//     }
+// }
 
-    fn build(mut self) -> Result<XskSocketInfo, String> {
-        let c_str = CString::new(self.inner.ifname.clone())
-            .map_err(|e| format!("error creating a cstring: {}", e))?;
+// struct XskPacket<'a> {
+//     buf: &'a mut [u8],
+//     addrs_tx: Sender<u64>,
+// }
 
-        let ifindex = unsafe { if_nametoindex(c_str.as_ptr() as *const i8) };
+// impl<'a> XskPacket<'a> {
+//     fn get_buf(&'a mut self) -> &'a mut [u8] {
+//         self.buf
+//     }
+// }
 
-        if ifindex == 0 {
-            return Err(format!(
-                "invalid interface {}: {}",
-                self.inner.ifname,
-                errno::errno()
-            ));
-        }
+// impl<'a> Drop for XskPacket<'a> {
+//     fn drop(&mut self) {
+//         // i think its ok to unwrap here, since at this point
+//         // such an error cant be handled
+//         match self.addrs_tx.try_send(self.buf.as_mut_ptr() as u64) {
+//             Ok(()) => {}
+//             Err(TrySendError::Closed(_)) => {}
+//             Err(TrySendError::Full(_)) => {
+//                 // this should never happen. since the size of the
+//                 // bounded channel is the number of frames in umem
+//                 // so we panic :)
+//                 panic!("addrs channel is full")
+//             }
+//         }
+//     }
+// }
 
-        let ret = unsafe {
-            xsk_socket__create(
-                &self.inner.sock as *const *mut xsk_socket as *mut *mut xsk_socket,
-                c_str.into_raw() as *const ::std::os::raw::c_char,
-                self.inner.if_queue_id,
-                self.inner.umem_info.umem.umem_p,
-                &self.inner.cons_ring as *const xsk_ring_cons as *mut xsk_ring_cons,
-                &self.inner.prod_ring as *const xsk_ring_prod as *mut xsk_ring_prod,
-                Box::into_raw(self.conf.clone()),
-            )
-        };
+// struct XskStream {
+//     inner: PollEvented<XskSocketAsync>,
+//     addrs_rx: Receiver<u64>,
+//     addrs_tx: Sender<u64>,
+// }
 
-        if ret != 0 {
-            return Err(format!("error creating xsk_socket: {}", ret));
-        }
+// impl<'a> XskStream {
+//     fn get_buf_by_idx(&'a mut self, idx: u32) -> Option<XskPacket<'a>> {
+//         let addr = unsafe {
+//             _xsk_ring_cons__rx_desc(
+//                 &self.inner.get_ref().inner.cons_ring as *const xsk_ring_cons,
+//                 idx,
+//             )
+//         };
 
-        #[cfg(feature = "bypass_link_xdp_id")]
-        {
-            let prog_id = 0u32;
-            let retw = unsafe {
-                bpf_get_link_xdp_id(
-                    ifindex as i32,
-                    &prog_id as *const u32 as *mut u32,
-                    self.conf.xdp_flags,
-                )
-            };
-            if retw != 0 {
-                unsafe { xsk_socket__delete(self.inner.sock) };
-                return Err(format!("error getting link xdp_id: {}", retw));
-            }
-        }
+//         if addr == std::ptr::null_mut() {
+//             return None;
+//         };
 
-        for i in 0..self.inner.umem_info.n_frames {
-            self.inner
-                .free_frames_idxes
-                .push(i * self.inner.umem_info.frame_size);
-        }
+//         Some(XskPacket {
+//             buf: unsafe {
+//                 std::slice::from_raw_parts_mut((*addr).addr as *mut u8, (*addr).len as usize)
+//             },
+//             addrs_tx: self.addrs_tx.clone(),
+//         })
+//     }
+// }
 
-        let mut idx = 0u32;
-        let ret = unsafe {
-            _xsk_ring_prod__reserve(
-                &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
-                self.conf.tx_size as u64,
-                &idx as *const u32 as *mut u32,
-            )
-        };
+// struct ConsumerHalf<'a>(&'a XskStream);
+// struct ProducerHalf<'a>(&'a XskStream);
 
-        if ret != self.conf.tx_size as u64 {
-            return Err(format!(
-                "error reserving prod ring of size {}, got {}",
-                self.conf.tx_size, ret
-            ));
-        }
+// struct OwnedConsumerHalf {
+//     inner: Arc<XskStream>,
+// }
 
-        for i in 0..self.conf.tx_size {
-            unsafe {
-                *_xsk_ring_prod__fill_addr(
-                    &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
-                    idx,
-                ) = self.inner.free_frames_idxes.pop().ok_or(format!(
-                    "not enoug frames to fill the producer. Expected {} got {}",
-                    self.conf.tx_size, i
-                ))?
-            };
-            idx += 1;
-        }
+// impl<'a> Stream for &'a OwnedConsumerHalf {
+//     type Item = io::Result<Vec<XskPacket<'a>>>;
 
-        unsafe {
-            _xsk_ring_prod__submit(
-                &self.inner.umem_info.prod as *const xsk_ring_prod as *mut xsk_ring_prod,
-                self.conf.tx_size as u64,
-            )
-        };
+//     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> std::task::Poll<Option<Self::Item>> {
+//         //this is the ready! macro from tokio .. i could not find a way to use it
+//         match self.inner.inner.poll_read_ready(cx, mio::Ready::readable()) {
+//             std::task::Poll::Ready(t) => t,
+//             std::task::Poll::Pending => return std::task::Poll::Pending,
+//         }?;
 
-        Ok(*self.inner)
-    }
+//         let cons = self.get_mut();
 
-    async fn build_async(mut self) -> Result<XskStream, String> {
-        let poll_evented = PollEvented::new(XskSocketAsync {
-            inner: self.build()?,
-        })
-        .map_err(|e| format!("error creating poll evented: {}", e))?;
+//         loop {
+//             match cons.inner.addrs_rx.try_recv() {
+//                 Ok(addr) => cons.inner.inner.get_ref().inner.free_frame_addrs.push(addr),
+//             };
+//         }
 
-        Ok(XskStream {
-            inner: poll_evented,
-        })
-    }
-}
+//         let rs_index = 0u32;
 
-#[cfg(test)]
+//         //let n_rcv = unsafe{ _xsk_ring_cons__peek(&self.inner.get_ref().inner.sock) }
+
+//         std::task::Poll::Pending
+//     }
+// }
+
+// struct OwnedProducerHalf(Arc<XskStream>);
+
+// impl XskStream {
+//     fn split(&mut self) -> (ConsumerHalf, ProducerHalf) {
+//         (ConsumerHalf(self), ProducerHalf(self))
+//     }
+
+//     fn into_split(self) -> (OwnedConsumerHalf, OwnedProducerHalf) {
+//         let arc = Arc::new(self);
+//         (
+//             OwnedConsumerHalf { inner: arc.clone() },
+//             OwnedProducerHalf(arc),
+//         )
+//     }
+// }
+
+// #[cfg(test)]
+// mod tests {
+//     #[test]
+//     fn basic_build_and_drop_umem() {
+//         assert!(crate::XskUmemInfoBuilder::new().build().is_ok());
+//     }
+
+//     // having both sync and async tests running will cause the one that is ran second to fail
+//     // idk why yet, but it seems like there should be some extra cleanup that we missed
+//     // for now, we leave the async one because it actually contains the sync part
+
+//     // after testing with --test-threads=1 and merging the two threads it is obvious that
+//     // this is a cleanup problem
+
+//     // #[test]
+//     // #[cfg(feature = "bypass_link_xdp_id")]
+//     // fn basic_build_and_drop_xsk_sync() {
+//     //     let umem = crate::XskUmemInfoBuilder::new().build();
+//     //     assert!(umem.is_ok());
+
+//     //     assert!(
+//     //         crate::XskSocketInfoBuilder::new(umem.unwrap(), "lo".to_string(), 0)
+//     //             .with_libbpf_flag(crate::XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD as u32)
+//     //             .build()
+//     //             .is_ok()
+//     //     );
+//     // }
+
+//     #[test]
+//     #[cfg(feature = "bypass_link_xdp_id")]
+//     fn basic_build_and_drop_xsk_async() {
+//         let umem = crate::XskUmemInfoBuilder::new().build();
+//         assert!(umem.is_ok());
+//         let mut rt = tokio::runtime::Builder::new()
+//             .threaded_scheduler()
+//             .enable_all()
+//             .build()
+//             .unwrap();
+//         let e = rt.block_on(
+//             crate::XskSocketInfoBuilder::new(umem.unwrap(), "lo".to_string(), 0)
+//                 .with_libbpf_flag(crate::XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD as u32)
+//                 .build_async(),
+//         );
+
+//         assert!(e.is_ok());
+//     }
+// }
+
 mod tests {
     #[test]
-    fn basic_build_and_drop_umem() {
-        assert!(crate::XskUmemInfoBuilder::new().build().is_ok());
+    fn invalid_fill_size() {
+        let umem = crate::umem::XskUmemInfoBuilder::new().with_fill_size(3);
+
+        assert!(umem.is_err());
     }
 
-    // having both sync and async tests running will cause the one that is ran second to fail
-    // idk why yet, but it seems like there should be some extra cleanup that we missed
-    // for now, we leave the async one because it actually contains the sync part
+    #[test]
+    fn valid_fill_size() {
+        let umem = crate::umem::XskUmemInfoBuilder::new().with_fill_size(2048);
 
-    // after testing with --test-threads=1 and merging the two threads it is obvious that
-    // this is a cleanup problem
-
-    // #[test]
-    // #[cfg(feature = "bypass_link_xdp_id")]
-    // fn basic_build_and_drop_xsk_sync() {
-    //     let umem = crate::XskUmemInfoBuilder::new().build();
-    //     assert!(umem.is_ok());
-
-    //     assert!(
-    //         crate::XskSocketInfoBuilder::new(umem.unwrap(), "lo".to_string(), 0)
-    //             .with_libbpf_flag(crate::XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD as u32)
-    //             .build()
-    //             .is_ok()
-    //     );
-    // }
+        assert!(umem.is_ok());
+    }
 
     #[test]
-    #[cfg(feature = "bypass_link_xdp_id")]
-    fn basic_build_and_drop_xsk_async() {
-        let umem = crate::XskUmemInfoBuilder::new().build();
-        assert!(umem.is_ok());
-        let mut rt = tokio::runtime::Builder::new()
-            .threaded_scheduler()
-            .enable_all()
-            .build()
-            .unwrap();
-        let e = rt.block_on(
-            crate::XskSocketInfoBuilder::new(umem.unwrap(), "lo".to_string(), 0)
-                .with_libbpf_flag(crate::XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD as u32)
-                .build_async(),
-        );
+    fn invalid_comp_size() {
+        let umem = crate::umem::XskUmemInfoBuilder::new().with_comp_size(3);
 
-        assert!(e.is_ok());
+        assert!(umem.is_err());
+    }
+
+    #[test]
+    fn valid_comp_size() {
+        let umem = crate::umem::XskUmemInfoBuilder::new().with_comp_size(2048);
+
+        assert!(umem.is_ok());
+    }
+
+    #[test]
+    fn valid_umem() {
+        let umem = crate::umem::XskUmemInfoBuilder::new().build();
+
+        assert!(umem.is_ok());
     }
 }
